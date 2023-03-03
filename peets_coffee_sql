@@ -1,37 +1,105 @@
 --Peets Coffee Unified Query
-with ae_trx as 
+--Find the distinct aloha transactions
+WITH ae_trx as 
 (
 select 
 LEFT(DATEOFBUSINESS,10) AS DATE,
-CHECKNUMBER,
 FKSTOREID, 
-SUM(PRICE) AS TRX_COST
+CHECKNUMBER,
+sum(PRICE) AS PRICE
 FROM
 RAW_PROD.AE.DPVHSTGNDITEM
-WHERE DATEOFBUSINESS >= '2023-02-01'
-GROUP BY
+WHERE DATEOFBUSINESS = '2023-02-14' 
+AND FKSTOREID = '1096'
+GROUP BY 
 LEFT(DATEOFBUSINESS,10),
-CHECKNUMBER,
-FKSTOREID 
+FKSTOREID, 
+CHECKNUMBER
 ),
-
+ 
+--Find the distinct paytronix transactions  ... this is the first part of the loyalty transactions
 ptrx_trx as 
-(
- select 
-  distinct
-  ACCOUNT_ID,
-  TRANSACTION_REQUEST_DETAIL_ID AS TRX_ID,
+(  
+  SELECT 
+  DISTINCT
   LEFT(TRANSACTION_DATETIME,10) AS DATE,
+  --TRANSACTION_DATETIME,
   CHECK_NUMBER,
   STORE_CODE,
-  STORE_NAME
-  FROM
-  RAW_PROD.PTRX.TRANSACTIONS
-  where TRANSACTION_DATETIME >= '2023-02-01' AND TRANSACTION_TYPE = 'Accrual / Redemption' and STORE_CODE != 'OLO' and STORE_CODE != 'corp'  --and STORE_CODE != 'autorelo' 
-  AND CARD_TEMPLATE = 'Peetnik Rewards'
+  ACCOUNT_ID,
+  1 as ptrx_flag
+  FROM RAW_PROD.PTRX.TRANSACTIONS 
+  where LEFT(TRANSACTION_DATETIME,10) = '2023-02-14'  
 ),
 
-ptrx_reg as 
+ --Find the remaining loyal transactions through a join of in RAW_PROD.OLO.ORDER_CLOSED_CLEAN and paytronix registrations
+ occ_01 as 
+(
+select 
+POSREF, CUSTOMER_EMAIL as EMAIL, 
+RAW_PROD.PTRX.REGISTRATIONS.ACCOUNT_ID,
+CAST(SPLIT(POSREF,'|')[2] AS INT) AS CHECKNUMBER
+from
+RAW_PROD.OLO.ORDER_CLOSED_CLEAN
+INNER JOIN
+RAW_PROD.PTRX.REGISTRATIONS
+on 
+RAW_PROD.OLO.ORDER_CLOSED_CLEAN.CUSTOMER_EMAIL = RAW_PROD.PTRX.REGISTRATIONS.EMAIL 
+WHERE STORENUMBER = 1096 AND TIMEPLACED LIKE '20230214%' 
+),
+
+ 
+ --Join together the paytronix loyalty transactions with the aloha transactions
+ ae_01 as 
+ (
+   select distinct ae_trx.*, ptrx_trx.ACCOUNT_ID from ae_trx inner join ptrx_trx on 
+   AE_TRX.DATE = ptrx_trx.DATE AND cast(AE_TRX.CHECKNUMBER as string) = cast(ptrx_trx.CHECK_NUMBER as string) AND cast(AE_TRX.FKSTOREID as string) = cast(ptrx_trx.STORE_CODE as string)
+ ),
+ 
+ --Join together the aloha transactions with the order closed clean transactions
+ ae_02 as 
+ (
+  select distinct ae_trx.*,occ_01.ACCOUNT_ID  from ae_trx 
+   inner join occ_01 
+   on
+   CAST(ae_trx.CHECKNUMBER AS STRING) = CAST(occ_01.CHECKNUMBER as string) 
+ ),
+ 
+ 
+ --Union together the two loyalty transactions dataset
+ loyal_union as 
+ (
+ select distinct CHECKNUMBER, ACCOUNT_ID from ae_01
+ union all
+ select distinct CHECKNUMBER, ACCOUNT_ID from ae_02
+ ),
+ 
+ --Join these with the aloha data
+ ae_join as 
+ (
+   select ae_trx.*, l.account_id from 
+ ae_trx
+ left join 
+ (select distinct CHECKNUMBER, ACCOUNT_ID FROM loyal_union) l
+ on cast(ae_trx.CHECKNUMBER as string) = cast(l.CHECKNUMBER as string)
+ ),
+ 
+ --Check to make sure that the account id's actually exist in paytronix registration, some do not
+ --Note we are aggregating the account id based on max value, this may not be the best process but need to elimnate a many to one join of account id w/ date, store id, check number
+ ae_join_gb
+ as 
+ 
+ (
+   select a.*,b.ptrx_reg
+   from 
+   (select DATE, FKSTOREID, CHECKNUMBER, MAX(ACCOUNT_ID) AS ACCOUNT_ID, AVG(PRICE) AS PRICE FROM ae_join GROUP BY DATE, FKSTOREID, CHECKNUMBER) a
+   left join
+   (select distinct 1 as ptrx_reg, ACCOUNT_ID FROM RAW_PROD.PTRX.REGISTRATIONS) b
+   on a.ACCOUNT_ID = b.ACCOUNT_ID
+
+ ),
+ 
+ ptrx_reg as 
 (
   
 select 
@@ -43,19 +111,18 @@ select
   A.EMAIL_OPT_IN,
   A.PUSH_OPT_IN,
   A.SMS_OPT_IN,
-  A.SMS_OPT_IN_VERIFIED,
-  1 AS PAYTRONIX_FLAG
-  FROM
-  (SELECT * FROM RAW_PROD.PTRX.REGISTRATIONS  where IS_REGISTERED = 1) A
-  INNER JOIN
+  A.SMS_OPT_IN_VERIFIED
+  FROM 
   (SELECT ACCOUNT_ID, MAX(_FILE_ROW_NUMBER) AS MAX_RECORD FROM RAW_PROD.PTRX.REGISTRATIONS GROUP BY ACCOUNT_ID ) MAX_ROW_DATA
+  JOIN
+  (SELECT * FROM RAW_PROD.PTRX.REGISTRATIONS) A
   ON 
-  A._FILE_ROW_NUMBER = MAX_ROW_DATA.MAX_RECORD
+  A._FILE_ROW_NUMBER = MAX_ROW_DATA.MAX_RECORD and A.ACCOUNT_ID = MAX_ROW_DATA.ACCOUNT_ID
 ),
 
 shopify as 
 (
-SELECT
+  SELECT
   ID as TRX_ID,
   CUSTOMERID,
   CUSTOMERFIRSTNAME,
@@ -66,58 +133,7 @@ SELECT
   'Shopify' as DATA_SOURCE
   FROM
   RAW_PROD.SHOPIFY.ORDERS
-  where PROCESSEDAT >= '2023-02-01'
-),
-
-
-ae_ptrx_j_01 as 
-(
-SELECT
-distinct
-ae_trx.DATE,
-ae_trx.CHECKNUMBER,
-ae_trx.FKSTOREID, 
-ae_trx.TRX_COST,
-ptrx_trx.ACCOUNT_ID,
-'AE' as DATA_SOURCE,
-CONCAT(ae_trx.DATE,ae_trx.CHECKNUMBER,ae_trx.FKSTOREID) AS TRX_ID
-FROM
-ae_trx
-LEFT JOIN
-ptrx_trx
-  ON CAST(ae_trx.CHECKNUMBER AS STRING) = CAST(ptrx_trx.CHECK_NUMBER AS STRING)
-  AND CAST(ae_trx.DATE AS STRING) = CAST(ptrx_trx.DATE AS STRING)
-  AND CAST(ae_trx.FKSTOREID AS STRING) = CAST(ptrx_trx.STORE_CODE AS STRING)
-),
---select  * from ae_ptrx_j_01 WHERE ACCOUNT_ID IS NOT NULL AND DATE = '2023-02-01' AND FKSTOREID = '1096' ORDER BY ACCOUNT_ID
---select DATE, count(*), COUNT(DISTINCT ACCOUNT_ID) from ae_ptrx_j_01 GROUP BY DATE ORDER BY DATE;
---SELECT DATE, COUNT(DISTINCT ACCOUNT_ID), COUNT(DISTINCT) FROM ae_ptrx_j_01 WHERE ACCOUNT_ID IS NOT NULL;  --234953
---SELECT COUNT(DISTINCT TRX_ID) FROM ptrx_trx;
---select FKSTOREID, SUM(TRX_COST) from ae_ptrx_j_01 WHERE ACCOUNT_ID IS NOT NULL GROUP BY FKSTOREID ORDER BY SUM(TRX_COST) DESC;
---select distinct * from ae_ptrx_j_01 where FKSTOREID = '1096' and ACCOUNT_ID IS NOT NULL;
---select FKSTOREID, SUM(TRX_COST) from ae_ptrx_j_01 GROUP BY FKSTOREID ORDER BY SUM(TRX_COST) DESC;
-
---DO ALL PTRX TRX 
-ae_ptrx_j_02 as 
-(
-SELECT
-ae_ptrx_j_01.DATE,
-ae_ptrx_j_01.CHECKNUMBER,
-ae_ptrx_j_01.FKSTOREID, 
-ae_ptrx_j_01.TRX_COST,
-ae_ptrx_j_01.ACCOUNT_ID,
-ae_ptrx_j_01.DATA_SOURCE,
-ae_ptrx_j_01.TRX_ID,  
-ptrx_reg.FIRST_NAME,
-ptrx_reg.LAST_NAME,
-ptrx_reg.EMAIL,
-ptrx_reg.POSTAL_CODE,
-ptrx_reg.PAYTRONIX_FLAG
-FROM
-ae_ptrx_j_01
-LEFT JOIN
-ptrx_reg
-  ON CAST(ae_ptrx_j_01.ACCOUNT_ID as STRING) = CAST(ptrx_reg.ACCOUNT_ID as STRING)
+  where LEFT(PROCESSEDAT,10) = '2022-02-14' 
 ),
 
 shopify_paytronix_join as 
@@ -134,8 +150,7 @@ shopify_paytronix_join as
   ptrx_reg.ACCOUNT_ID,
   ptrx_reg.FIRST_NAME,
   ptrx_reg.LAST_NAME,
-  ptrx_reg.POSTAL_CODE,
-  ptrx_reg.PAYTRONIX_FLAG
+  ptrx_reg.POSTAL_CODE
   FROM shopify
   LEFT JOIN
   ptrx_reg
@@ -146,18 +161,14 @@ shopify_ae_union as
 (
 select 
 DATE,
-CAST(TRX_ID AS STRING) AS TRX_ID,
+CONCAT(DATE,FKSTOREID,CHECKNUMBER) AS TRX_ID,
 ACCOUNT_ID,  
-TRX_COST,
+PRICE AS TRX_COST,
 CASE WHEN ACCOUNT_ID IS NOT NULL THEN TRX_COST ELSE 0 END AS PTRX_COST,
-DATA_SOURCE,
---ae_ptrx_j_02.FIRST_NAME,
---ae_ptrx_j_02.LAST_NAME,
---ae_ptrx_j_02.EMAIL,
---ae_ptrx_j_02.POSTAL_CODE,
-PAYTRONIX_FLAG  
+CASE WHEN ACCOUNT_ID IS NOT NULL THEN 1 ELSE 0 END AS PAYTRONIX_TRX,  
+'AE' as DATA_SOURCE
 from
-ae_ptrx_j_02  
+ae_join_gb  
 union all
 select  
 DATE,
@@ -165,18 +176,37 @@ CAST(TRX_ID AS STRING) AS TRX_ID,
 ACCOUNT_ID,
 TOTALPRICE AS TRX_COST,
 CASE WHEN ACCOUNT_ID IS NOT NULL THEN TRX_COST ELSE 0 END AS PTRX_COST,
-DATA_SOURCE ,
-PAYTRONIX_FLAG
+CASE WHEN ACCOUNT_ID IS NOT NULL THEN 1 ELSE 0 END AS PAYTRONIX_TRX,  
+DATA_SOURCE
 from
 shopify_paytronix_join    
+),
+
+
+account_summary_0 as 
+(
+SELECT 
+ACCOUNT_ID,
+DATA_SOURCE,
+CASE WHEN DATA_SOURCE = 'AE' THEN TRX_COST ELSE 0 END AS AE_TRX_COST,
+CASE WHEN DATA_SOURCE = 'Shopify' then TRX_COST ELSE 0 END AS Shopify_TRX_Cost,
+CASE WHEN DATA_SOURCE = 'AE' THEN TRX_ID ELSE NULL END AS AE_TRX_ID,
+CASE WHEN DATA_SOURCE = 'Shopify' then TRX_ID ELSE NULL END AS Shopify_TRX_ID  
+FROM
+shopify_ae_union
 )
 
-SELECT 
+
+
+SELECT
 DATA_SOURCE,
-COUNT(DISTINCT TRX_ID) AS trx_count,
-SUM(PAYTRONIX_FLAG) AS paytronix_trx_count,
-COUNT(DISTINCT ACCOUNT_ID) as paytronix_customer_count,
-sum(TRX_COST) as TRX_COST,
-SUM(PTRX_COST) AS PTRX_COST
-FROM shopify_ae_union
-GROUP BY DATA_SOURCE;
+SUM(PAYTRONIX_TRX) AS PAYTRONIX_TRX,
+SUM(PTRX_COST) AS PAYTRONIX_COST,
+COUNT(DISTINCT TRX_ID) AS TRX,
+SUM(TRX_COST) AS TRX_COST,
+COUNT(DISTINCT ACCOUNT_ID)
+FROM
+shopify_ae_union
+WHERE ACCOUNT_ID IS NOT NULL
+GROUP BY
+DATA_SOURCE;
